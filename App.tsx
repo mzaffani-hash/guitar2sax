@@ -17,14 +17,13 @@ const App: React.FC = () => {
   
   // Audio Context Refs
   const audioContextRef = useRef<AudioContext | null>(null);
-  const inputSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const inputAnalyserRef = useRef<AnalyserNode | null>(null);
   const outputAnalyserRef = useRef<AnalyserNode | null>(null);
   
   // Processing Refs
   const sessionRef = useRef<any>(null);
   const chunksRef = useRef<Float32Array[]>([]);
-  const isProcessingRef = useRef<boolean>(false);
+  const isStreamingRef = useRef<boolean>(false);
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Initialize Audio Contexts
@@ -85,7 +84,7 @@ const App: React.FC = () => {
 
     setAppState(AppState.PROCESSING);
     chunksRef.current = [];
-    isProcessingRef.current = true;
+    isStreamingRef.current = true;
     setErrorMsg(null);
 
     const client = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -100,20 +99,27 @@ const App: React.FC = () => {
             model: 'gemini-2.5-flash-native-audio-preview-09-2025',
             config: {
                 responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } }
+                },
                 systemInstruction: `
-                    Sei un arrangiatore virtuoso. 
-                    Il tuo compito è trasformare l'audio della chitarra elettrica in ingresso in un assolo di sassofono tenore Jazz espressivo.
+                    Sei un musicista jazz esperto (sassofonista).
+                    Il tuo compito è ricevere un input audio (assolo di chitarra) e suonarlo nuovamente usando il timbro del sassofono.
                     
-                    REGOLE:
-                    1. Ascolta l'intero input audio.
-                    2. Genera SOLO musica (sassofono). Non parlare mai.
-                    3. Mantieni la melodia e il ritmo originali ma adattali allo stile del sassofono.
-                    4. Appena ricevi il comando di fine input, inizia a suonare.
+                    ISTRUZIONI CRITICHE:
+                    1. NON GENERARE NULLA finché non ricevi il messaggio "FINE_INPUT".
+                    2. Quando ricevi "FINE_INPUT", genera SOLO musica. Non parlare, non dire "Ecco il brano". Solo note di sassofono.
+                    3. Sii espressivo, aggiungi vibrato e dinamica jazz.
                 `,
             },
             callbacks: {
                 onopen: async () => {
                     console.log("Gemini Live Connected");
+                    // Setup Phase: Tell model to wait
+                    sessionPromise.then(s => s.sendRealtimeInput({
+                        content: [{ text: "Sto per inviarti un flusso audio. Ascolta silenziosamente e attendi il mio segnale di fine." }]
+                    }));
+                    
                     // Start streaming audio chunks
                     await streamAudioToGemini(pcmData, sessionPromise);
                 },
@@ -131,8 +137,14 @@ const App: React.FC = () => {
                          chunksRef.current.push(float32Data);
                      }
                      
-                     // Handle Turn Completion (This is the signal that the model has finished generating)
+                     // Handle Turn Completion
                      if (message.serverContent?.turnComplete) {
+                         // Ignore turn completion if we are still streaming input (it might be an interruption)
+                         if (isStreamingRef.current) {
+                             console.log("Interruzione rilevata durante lo streaming. Ignoro il turnComplete parziale.");
+                             return;
+                         }
+                         
                          console.log("Turn complete received. Closing session.");
                          sessionPromise.then(s => s.close());
                      }
@@ -145,7 +157,7 @@ const App: React.FC = () => {
                 onerror: (e) => {
                     console.error("Gemini Error", e);
                     if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
-                    setErrorMsg("Errore durante la connessione o streaming.");
+                    setErrorMsg("Errore durante la connessione o streaming. Riprova.");
                     setAppState(AppState.ERROR);
                 }
             }
@@ -171,14 +183,15 @@ const App: React.FC = () => {
 
       streamIntervalRef.current = setInterval(async () => {
           // Check if we have finished the data
-          if (offset >= data.length || !isProcessingRef.current) {
+          if (offset >= data.length || !isStreamingRef.current) {
               if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
-              
-              // IMPORTANT: Tell the model we are done sending audio and it should generate now.
-              // This ensures we don't rely solely on Voice Activity Detection which might be flaky with music.
+              isStreamingRef.current = false; // Mark streaming as done
+
+              // IMPORTANT: Trigger generation explicitly
+              console.log("Sending trigger command...");
               sessionPromise.then(session => {
                   session.sendRealtimeInput({
-                      content: [{ text: "L'input audio è terminato. Genera ora l'assolo di sassofono." }] 
+                      content: [{ text: "FINE_INPUT. Trasforma tutto l'audio ricevuto in un assolo di sassofono adesso." }] 
                   });
               });
               return;
@@ -205,11 +218,17 @@ const App: React.FC = () => {
   };
 
   const finalizeOutput = useCallback(async () => {
-      isProcessingRef.current = false;
+      isStreamingRef.current = false;
       
       if (chunksRef.current.length === 0) {
-          setAppState(AppState.ERROR);
-          setErrorMsg("Nessun audio generato. Riprova, assicurati che il file non sia silenzioso.");
+          // Don't set error immediately if user just cancelled, but here assuming automatic flow
+          // However, if connection closed without chunks, it's likely an error or empty response
+          // We will check appState to ensure we don't overwrite an existing error
+          setAppState(prev => {
+             if (prev === AppState.ERROR) return prev;
+             setErrorMsg("Nessun audio generato. L'IA potrebbe non aver risposto con musica.");
+             return AppState.ERROR;
+          });
           return;
       }
 
@@ -224,12 +243,18 @@ const App: React.FC = () => {
 
       if (!audioContextRef.current) return;
 
-      // Create AudioBuffer
-      const audioBuffer = audioContextRef.current.createBuffer(1, totalLength, OUTPUT_SAMPLE_RATE);
-      audioBuffer.copyToChannel(combinedBuffer, 0);
+      try {
+          // Create AudioBuffer
+          const audioBuffer = audioContextRef.current.createBuffer(1, totalLength, OUTPUT_SAMPLE_RATE);
+          audioBuffer.copyToChannel(combinedBuffer, 0);
 
-      setOutputBuffer(audioBuffer);
-      setAppState(AppState.COMPLETED);
+          setOutputBuffer(audioBuffer);
+          setAppState(AppState.COMPLETED);
+      } catch(e) {
+          console.error("Buffer creation error", e);
+          setErrorMsg("Errore nella creazione del buffer audio.");
+          setAppState(AppState.ERROR);
+      }
   }, []);
 
 
@@ -245,6 +270,7 @@ const App: React.FC = () => {
       const buffer = type === 'input' ? inputBuffer : outputBuffer;
       if (!buffer) return;
 
+      // Stop previous source if needed (simple implementation: just play over)
       const source = audioContextRef.current.createBufferSource();
       source.buffer = buffer;
       
