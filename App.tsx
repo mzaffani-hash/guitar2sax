@@ -3,7 +3,7 @@ import { AppState } from './types';
 import { Visualizer } from './components/Visualizer';
 import { resampleBuffer, float32ToInt16, audioBufferToWav, base64ToUint8Array, uint8ArrayToBase64 } from './services/audioUtils';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
-import { Upload, Play, Square, Download, Music, Activity, Mic2, AlertCircle } from 'lucide-react';
+import { Upload, Play, Download, Music, Activity, Mic2, AlertCircle } from 'lucide-react';
 
 const INPUT_SAMPLE_RATE = 16000;
 const OUTPUT_SAMPLE_RATE = 24000;
@@ -25,10 +25,12 @@ const App: React.FC = () => {
   const sessionRef = useRef<any>(null);
   const chunksRef = useRef<Float32Array[]>([]);
   const isProcessingRef = useRef<boolean>(false);
+  const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Initialize Audio Contexts
   useEffect(() => {
-    audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    audioContextRef.current = new AudioContextClass({
         sampleRate: OUTPUT_SAMPLE_RATE // Prefer output rate for main context
     });
     inputAnalyserRef.current = audioContextRef.current.createAnalyser();
@@ -39,6 +41,7 @@ const App: React.FC = () => {
 
     return () => {
       audioContextRef.current?.close();
+      if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
     };
   }, []);
 
@@ -55,13 +58,15 @@ const App: React.FC = () => {
     try {
       const arrayBuffer = await file.arrayBuffer();
       if (!audioContextRef.current) return;
+      
+      // Decode audio data
       const decodedBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
       setInputBuffer(decodedBuffer);
       setAppState(AppState.READY);
       setErrorMsg(null);
     } catch (err) {
       console.error(err);
-      setErrorMsg("Failed to decode audio file. Please try a valid WAV or MP3.");
+      setErrorMsg("Impossibile decodificare il file audio. Usa un file WAV o MP3 valido.");
       setAppState(AppState.ERROR);
     }
   };
@@ -69,13 +74,19 @@ const App: React.FC = () => {
   // Core Logic: Tone Transfer via Gemini Live
   const startToneTransfer = async () => {
     if (!inputBuffer || !process.env.API_KEY) {
-      if (!process.env.API_KEY) setErrorMsg("API Key is missing.");
+      if (!process.env.API_KEY) setErrorMsg("API Key mancante.");
       return;
+    }
+
+    // Important: Resume AudioContext context on user gesture to prevent browser blocking
+    if (audioContextRef.current?.state === 'suspended') {
+      await audioContextRef.current.resume();
     }
 
     setAppState(AppState.PROCESSING);
     chunksRef.current = [];
     isProcessingRef.current = true;
+    setErrorMsg(null);
 
     const client = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -84,18 +95,20 @@ const App: React.FC = () => {
     const pcmData = pcmBuffer.getChannelData(0); // Mono
     
     // 2. Connect to Gemini Live
-    // Use a promise wrapper to handle the connection and stream logic
     try {
         const sessionPromise = client.live.connect({
             model: 'gemini-2.5-flash-native-audio-preview-09-2025',
             config: {
                 responseModalities: [Modality.AUDIO],
                 systemInstruction: `
-                    You are a world-class virtuoso musical arranger. 
-                    TASK: Listen to the incoming audio stream, which is a guitar solo.
-                    ACTION: Instantly reproduce the exact melody, phrasing, and dynamics using a **Saxophone** voice.
-                    STYLE: Expressive, jazz-influenced, breathy, with realistic vibrato.
-                    CONSTRAINT: Do not speak. Do not output words. Only output the musical transformation.
+                    Sei un arrangiatore virtuoso. 
+                    Il tuo compito è trasformare l'audio della chitarra elettrica in ingresso in un assolo di sassofono tenore Jazz espressivo.
+                    
+                    REGOLE:
+                    1. Ascolta l'intero input audio.
+                    2. Genera SOLO musica (sassofono). Non parlare mai.
+                    3. Mantieni la melodia e il ritmo originali ma adattali allo stile del sassofono.
+                    4. Appena ricevi il comando di fine input, inizia a suonare.
                 `,
             },
             callbacks: {
@@ -105,6 +118,7 @@ const App: React.FC = () => {
                     await streamAudioToGemini(pcmData, sessionPromise);
                 },
                 onmessage: async (message: LiveServerMessage) => {
+                     // Handle Audio Output
                      const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
                      if (base64Audio) {
                          const bytes = base64ToUint8Array(base64Audio);
@@ -117,17 +131,21 @@ const App: React.FC = () => {
                          chunksRef.current.push(float32Data);
                      }
                      
+                     // Handle Turn Completion (This is the signal that the model has finished generating)
                      if (message.serverContent?.turnComplete) {
-                         console.log("Turn complete");
+                         console.log("Turn complete received. Closing session.");
+                         sessionPromise.then(s => s.close());
                      }
                 },
                 onclose: () => {
                     console.log("Connection Closed");
+                    if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
                     finalizeOutput();
                 },
                 onerror: (e) => {
                     console.error("Gemini Error", e);
-                    setErrorMsg("Stream error occurred.");
+                    if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
+                    setErrorMsg("Errore durante la connessione o streaming.");
                     setAppState(AppState.ERROR);
                 }
             }
@@ -137,7 +155,7 @@ const App: React.FC = () => {
 
     } catch (e) {
         console.error(e);
-        setErrorMsg("Failed to connect to Gemini API.");
+        setErrorMsg("Impossibile connettersi all'API Gemini.");
         setAppState(AppState.ERROR);
     }
   };
@@ -145,19 +163,24 @@ const App: React.FC = () => {
   // Stream audio in real-time-ish chunks to simulate a live feed
   const streamAudioToGemini = async (data: Float32Array, sessionPromise: Promise<any>) => {
       const CHUNK_SIZE = 4096; // Samples per chunk
-      // 16000 samples per second. 4096 samples is approx 256ms.
-      // We need to throttle sending to match playback speed roughly, otherwise we flood the socket.
       const intervalTime = (CHUNK_SIZE / INPUT_SAMPLE_RATE) * 1000; 
       
       let offset = 0;
 
-      const intervalId = setInterval(async () => {
+      if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
+
+      streamIntervalRef.current = setInterval(async () => {
+          // Check if we have finished the data
           if (offset >= data.length || !isProcessingRef.current) {
-              clearInterval(intervalId);
-              // End of stream signal? We just close the session after a brief delay to let response finish
-              setTimeout(() => {
-                   sessionPromise.then(s => s.close());
-              }, 2000);
+              if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
+              
+              // IMPORTANT: Tell the model we are done sending audio and it should generate now.
+              // This ensures we don't rely solely on Voice Activity Detection which might be flaky with music.
+              sessionPromise.then(session => {
+                  session.sendRealtimeInput({
+                      content: [{ text: "L'input audio è terminato. Genera ora l'assolo di sassofono." }] 
+                  });
+              });
               return;
           }
 
@@ -165,8 +188,6 @@ const App: React.FC = () => {
           const chunk = data.slice(offset, end);
           const int16Chunk = float32ToInt16(chunk);
           
-          // Create Blob/Base64 for the chunk
-          // Gemini Live expects raw PCM bytes in base64, wrapped in JSON
           const uint8 = new Uint8Array(int16Chunk.buffer);
           const base64Data = uint8ArrayToBase64(uint8);
 
@@ -179,20 +200,16 @@ const App: React.FC = () => {
               });
           });
 
-          // Also visualize input locally
-          if (audioContextRef.current && inputAnalyserRef.current) {
-             // This is a rough visualization hack since we aren't playing the input audibly during processing
-             // Ideally we create a buffer source and play it, but to keep it simple we just trust the user waits.
-          }
-
           offset += CHUNK_SIZE;
       }, intervalTime);
   };
 
   const finalizeOutput = useCallback(async () => {
+      isProcessingRef.current = false;
+      
       if (chunksRef.current.length === 0) {
           setAppState(AppState.ERROR);
-          setErrorMsg("No audio generated.");
+          setErrorMsg("Nessun audio generato. Riprova, assicurati che il file non sia silenzioso.");
           return;
       }
 
@@ -213,13 +230,18 @@ const App: React.FC = () => {
 
       setOutputBuffer(audioBuffer);
       setAppState(AppState.COMPLETED);
-      isProcessingRef.current = false;
   }, []);
 
 
   // Playback Handling
   const playAudio = (type: 'input' | 'output') => {
       if (!audioContextRef.current) return;
+      
+      // Ensure context is running
+      if (audioContextRef.current.state === 'suspended') {
+          audioContextRef.current.resume();
+      }
+
       const buffer = type === 'input' ? inputBuffer : outputBuffer;
       if (!buffer) return;
 
@@ -275,10 +297,10 @@ const App: React.FC = () => {
         {/* Intro / Instructions */}
         <div className="text-center space-y-4">
             <h2 className="text-3xl md:text-5xl font-bold bg-gradient-to-br from-white to-zinc-500 bg-clip-text text-transparent">
-                Reimagine your riffs.
+                Reimmagina i tuoi riff.
             </h2>
             <p className="text-zinc-400 max-w-xl mx-auto text-lg">
-                Upload a clean guitar solo. Our AI arranger listens and performs it back on a saxophone, capturing every nuance.
+                Carica un assolo di chitarra. La nostra IA "Virtuoso" lo trasforma in un'esecuzione di sassofono, catturando ogni sfumatura.
             </p>
         </div>
 
@@ -309,8 +331,8 @@ const App: React.FC = () => {
                          <label className="flex flex-col items-center justify-center w-full h-48 border-2 border-zinc-700 border-dashed rounded-xl cursor-pointer bg-zinc-800/30 hover:bg-zinc-800/50 hover:border-amber-500/50 transition-all group">
                             <div className="flex flex-col items-center justify-center pt-5 pb-6">
                                 <Upload className="w-10 h-10 mb-3 text-zinc-500 group-hover:text-amber-500 transition-colors" />
-                                <p className="mb-2 text-sm text-zinc-400"><span className="font-semibold text-zinc-200">Click to upload</span> or drag and drop</p>
-                                <p className="text-xs text-zinc-500">WAV, MP3 (Solo Guitar Recommended)</p>
+                                <p className="mb-2 text-sm text-zinc-400"><span className="font-semibold text-zinc-200">Clicca per caricare</span> o trascina un file</p>
+                                <p className="text-xs text-zinc-500">WAV, MP3 (Consigliato Assolo di Chitarra)</p>
                             </div>
                             <input type="file" className="hidden" onChange={handleFileUpload} accept="audio/*" />
                         </label>
@@ -319,10 +341,10 @@ const App: React.FC = () => {
                             <Visualizer analyser={inputAnalyserRef.current} color="#fbbf24" isActive={true} />
                             <div className="flex gap-4">
                                 <button onClick={() => playAudio('input')} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-sm font-medium transition-colors">
-                                    <Play className="w-4 h-4" /> Preview Input
+                                    <Play className="w-4 h-4" /> Anteprima Input
                                 </button>
                                 <button onClick={() => { setInputBuffer(null); setOutputBuffer(null); setAppState(AppState.IDLE); }} className="text-zinc-500 hover:text-zinc-300 text-sm underline ml-auto">
-                                    Replace File
+                                    Sostituisci File
                                 </button>
                             </div>
                         </div>
@@ -337,12 +359,12 @@ const App: React.FC = () => {
                          <div className="w-16 h-16 rounded-full bg-amber-500/20 flex items-center justify-center border-2 border-amber-500/50">
                              <Activity className="w-8 h-8 text-amber-500 animate-spin" />
                          </div>
-                         <p className="text-amber-500 font-mono text-sm">ARRANGING...</p>
+                         <p className="text-amber-500 font-mono text-sm">ARRANGIAMENTO IN CORSO...</p>
                      </div>
                  ) : (
                     <button 
                         onClick={startToneTransfer}
-                        disabled={!inputBuffer || appState === AppState.PROCESSING}
+                        disabled={!inputBuffer}
                         className={`
                             group relative px-8 py-4 rounded-full font-bold text-lg transition-all shadow-xl
                             ${!inputBuffer 
@@ -351,7 +373,7 @@ const App: React.FC = () => {
                             }
                         `}
                     >
-                        Transform to Saxophone
+                        Trasforma in Sassofono
                         {inputBuffer && <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping" />}
                     </button>
                  )}
@@ -364,19 +386,19 @@ const App: React.FC = () => {
                     <div className="flex justify-between items-center mb-6">
                         <h3 className="text-lg font-semibold text-white flex items-center gap-2">
                             <Music className="w-4 h-4 text-amber-400" /> 
-                            Saxophone Output
+                            Output Sassofono
                         </h3>
-                        <span className="text-xs font-mono text-amber-500 border border-amber-500/30 px-2 py-1 rounded bg-amber-500/10">GENERATED</span>
+                        <span className="text-xs font-mono text-amber-500 border border-amber-500/30 px-2 py-1 rounded bg-amber-500/10">GENERATO</span>
                     </div>
 
                     <div className="space-y-6">
                         <Visualizer analyser={outputAnalyserRef.current} color="#10b981" isActive={true} />
                         <div className="flex flex-wrap gap-4">
                              <button onClick={() => playAudio('output')} className="flex-1 flex items-center justify-center gap-2 px-6 py-3 bg-white text-black hover:bg-zinc-200 rounded-xl font-bold transition-colors shadow-lg shadow-white/10">
-                                <Play className="w-5 h-5" /> Play Result
+                                <Play className="w-5 h-5" /> Ascolta Risultato
                             </button>
                             <button onClick={downloadOutput} className="flex-1 flex items-center justify-center gap-2 px-6 py-3 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl font-medium transition-colors border border-zinc-700">
-                                <Download className="w-5 h-5" /> Download WAV
+                                <Download className="w-5 h-5" /> Scarica WAV
                             </button>
                         </div>
                     </div>
