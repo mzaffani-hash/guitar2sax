@@ -16,3 +16,12 @@ export interface VisualizerProps {
   color: string;
   isActive: boolean;
 }
+
+export interface AudioEffects {
+  reverbMix: number; // 0 to 1
+  reverbDecay: number; // seconds
+  eqLow: number; // dB
+  eqMid: number; // dB
+  eqHigh: number; // dB
+  compressorThreshold: number; // dB
+}
