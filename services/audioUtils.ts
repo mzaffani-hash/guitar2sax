@@ -1,8 +1,10 @@
 
-// Utility to resample audio buffer to target sample rate (e.g., 16kHz for Gemini Input)
+import { NoteEvent, InstrumentType } from '../types';
+
+// Utility to resample audio buffer to target sample rate
 export async function resampleBuffer(audioBuffer: AudioBuffer, targetSampleRate: number): Promise<AudioBuffer> {
   const offlineContext = new OfflineAudioContext(
-    1, // Mono is sufficient for tone transfer input to save bandwidth
+    1, 
     (audioBuffer.length * targetSampleRate) / audioBuffer.sampleRate,
     targetSampleRate
   );
@@ -15,14 +17,45 @@ export async function resampleBuffer(audioBuffer: AudioBuffer, targetSampleRate:
   return offlineContext.startRendering();
 }
 
-// Convert Float32Array to Int16Array (PCM)
-export function float32ToInt16(float32: Float32Array): Int16Array {
-  const int16 = new Int16Array(float32.length);
-  for (let i = 0; i < float32.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32[i]));
-    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+// Trim silence from start and end of buffer
+export function trimSilence(input: AudioBuffer, ctx: AudioContext): AudioBuffer {
+  const channelData = input.getChannelData(0);
+  const threshold = 0.005; // -46dB roughly
+  let start = 0;
+  let end = channelData.length;
+
+  // Find start
+  for (let i = 0; i < channelData.length; i++) {
+    if (Math.abs(channelData[i]) > threshold) {
+      start = i;
+      break;
+    }
   }
-  return int16;
+
+  // Find end
+  for (let i = channelData.length - 1; i > start; i--) {
+    if (Math.abs(channelData[i]) > threshold) {
+      end = i + 1; // Include the sample
+      break;
+    }
+  }
+
+  const padding = Math.floor(input.sampleRate * 0.05);
+  start = Math.max(0, start - padding);
+  end = Math.min(channelData.length, end + padding);
+  
+  const length = end - start;
+  if (length <= 0 || length >= input.length) return input;
+
+  const newBuffer = ctx.createBuffer(input.numberOfChannels, length, input.sampleRate);
+  for (let ch = 0; ch < input.numberOfChannels; ch++) {
+    const oldData = input.getChannelData(ch);
+    const newData = newBuffer.getChannelData(ch);
+    for (let i = 0; i < length; i++) {
+      newData[i] = oldData[start + i];
+    }
+  }
+  return newBuffer;
 }
 
 // Convert AudioBuffer to WAV Blob for download
@@ -60,10 +93,9 @@ export function audioBufferToWav(buffer: AudioBuffer): Blob {
 
   while (pos < buffer.length) {
     for (i = 0; i < numOfChan; i++) {
-      // interleave channels
-      sample = Math.max(-1, Math.min(1, channels[i][pos])); // clamp
-      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit signed int
-      view.setInt16(44 + offset, sample, true); // write 16-bit sample
+      sample = Math.max(-1, Math.min(1, channels[i][pos])); 
+      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0;
+      view.setInt16(44 + offset, sample, true);
       offset += 2;
     }
     pos++;
@@ -82,31 +114,6 @@ export function audioBufferToWav(buffer: AudioBuffer): Blob {
   }
 }
 
-// Helper to decode base64 to Uint8Array
-export function base64ToUint8Array(base64: string): Uint8Array {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
-// Helper to encode Uint8Array to base64
-export function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Generates a synthetic impulse response for Reverb convolution.
- * Approximates a room decay without needing external .wav files.
- */
 export function createImpulseResponse(context: AudioContext, duration: number, decay: number, reverse: boolean = false): AudioBuffer {
   const sampleRate = context.sampleRate;
   const length = sampleRate * duration;
@@ -116,10 +123,7 @@ export function createImpulseResponse(context: AudioContext, duration: number, d
 
   for (let i = 0; i < length; i++) {
     let n = reverse ? length - i : i;
-    // Exponential decay function
     const amplitude = Math.pow(1 - n / length, decay);
-    
-    // White noise shaped by decay
     left[i] = (Math.random() * 2 - 1) * amplitude;
     right[i] = (Math.random() * 2 - 1) * amplitude;
   }
@@ -128,186 +132,458 @@ export function createImpulseResponse(context: AudioContext, duration: number, d
 }
 
 /**
- * Analyzes AudioBuffer to extract pitch and generates a MIDI file.
- * Uses improved AMDF with Median Filtering and Duration Thresholding for accuracy.
+ * HIGH PRECISION NOTE EXTRACTION
  */
-export function generateMidiFromBuffer(buffer: AudioBuffer): Blob | null {
-    const data = buffer.getChannelData(0); // Analyze mono
+export function extractNotesFromBuffer(buffer: AudioBuffer): NoteEvent[] {
+    const rawData = buffer.getChannelData(0);
     const sampleRate = buffer.sampleRate;
     
-    // 1. Analysis Parameters
-    const windowSize = 1024; // ~42ms at 24kHz
-    const hopSize = 512;     // 50% Overlap
-    const rmsThreshold = 0.015; // Silence threshold
+    // Stronger Low Pass for guitar fundamental extraction
+    const data = applyLowPassFilter(rawData, 700, sampleRate);
+
+    const windowSize = 1024; 
+    const hopSize = 256; 
+    const rmsThreshold = 0.02; 
     
     const pitchFrames: number[] = [];
+    const rmsFrames: number[] = [];
     const timeSteps: number[] = [];
 
-    // 2. Frame-based Pitch Extraction
     for (let i = 0; i < data.length - windowSize; i += hopSize) {
-        const chunk = data.slice(i, i + windowSize);
-        
-        // Calculate RMS
-        let sumSq = 0;
-        for (let s = 0; s < chunk.length; s++) sumSq += chunk[s] * chunk[s];
-        const rms = Math.sqrt(sumSq / chunk.length);
+        let sumSqRaw = 0;
+        for (let s = 0; s < windowSize; s++) {
+            const val = rawData[i + s];
+            sumSqRaw += val * val;
+        }
+        const rms = Math.sqrt(sumSqRaw / windowSize);
 
         let midiNote = 0;
-        
         if (rms > rmsThreshold) {
+             const chunk = data.slice(i, i + windowSize);
              const freq = detectPitchAMDF(chunk, sampleRate);
-             if (freq > 0) {
-                 // Convert to MIDI note: 69 + 12*log2(freq/440)
+             // Stricter range to avoid sub-bass rumble or high squeaks
+             if (freq > 75 && freq < 1200) { 
                  const floatNote = 69 + 12 * Math.log2(freq / 440);
                  midiNote = Math.round(floatNote);
-                 
-                 // Clamp to reasonable instrument range (approx C2 to C7)
-                 // to avoid octave errors in low/high extremes
-                 if (midiNote < 36 || midiNote > 96) midiNote = 0;
              }
         }
         
         pitchFrames.push(midiNote);
+        rmsFrames.push(rms);
         timeSteps.push(i / sampleRate);
     }
 
-    // 3. Post-Processing: Median Filtering
-    // Removes single-frame glitches by looking at neighbors (window size 5)
-    const smoothedNotes = medianFilter(pitchFrames, 5);
+    // Median filter 7 frames ~ 40ms
+    const smoothedNotes = medianFilter(pitchFrames, 7);
 
-    // 4. Note Segmentation
-    const notes: {note: number, start: number, duration: number}[] = [];
-    
+    const notes: NoteEvent[] = [];
     let currentNote = 0;
-    let currentStart = 0;
+    let currentStartIndex = 0;
     const frameDuration = hopSize / sampleRate;
 
-    // Iterate smoothed frames to build discrete Note events
-    for (let i = 0; i < smoothedNotes.length; i++) {
-        const note = smoothedNotes[i];
+    const addNote = (noteNumber: number, startIndex: number, endIndex: number) => {
+        const startTime = timeSteps[startIndex];
+        const duration = (endIndex - startIndex) * frameDuration;
         
-        if (note !== currentNote) {
-            // Status Change
-            if (currentNote > 0) {
-                // End previous note
-                // Calculate start time based on frame index
-                const startTime = timeSteps[Math.floor(currentStart / frameDuration)] || 0;
-                const duration = (i * frameDuration) - currentStart;
-                
-                // Minimum Duration Filter: Ignore notes shorter than 60ms (likely noise or transient)
-                if (duration > 0.06) { 
-                     notes.push({
-                        note: currentNote,
-                        start: startTime,
-                        duration: duration
-                    });
-                }
+        // Discard very short glitches < 60ms
+        if (duration > 0.06) { 
+            let maxRms = 0;
+            for(let j = startIndex; j < endIndex && j < rmsFrames.length; j++) {
+                if (rmsFrames[j] > maxRms) maxRms = rmsFrames[j];
             }
             
-            // Start new note
-            currentNote = note;
-            currentStart = i * frameDuration;
-        }
-    }
-    
-    // Handle final note if active
-    if (currentNote > 0) {
-         const duration = (smoothedNotes.length * frameDuration) - currentStart;
-         if (duration > 0.06) {
+            const normalized = Math.min(1.0, maxRms * 4); 
+            const velocity = Math.max(0.3, normalized);
+
             notes.push({
-                note: currentNote,
-                start: timeSteps[Math.floor(currentStart / frameDuration)] || 0,
-                duration: duration
+                note: noteNumber,
+                start: startTime,
+                duration: duration,
+                velocity: velocity
             });
-         }
-    }
-
-    if (notes.length === 0) return null;
-
-    return createMidiFile(notes);
-}
-
-// Improved AMDF (Average Magnitude Difference Function) Detection
-function detectPitchAMDF(buffer: Float32Array, sampleRate: number): number {
-    let rms = 0;
-    for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i];
-    rms = Math.sqrt(rms / buffer.length);
-    // Double check RMS inside detector just in case
-    if (rms < 0.01) return 0; 
-
-    const minFreq = 70;   // ~C2
-    const maxFreq = 1100; // ~C6
-    const minPeriod = Math.floor(sampleRate / maxFreq);
-    const maxPeriod = Math.floor(sampleRate / minFreq);
-
-    let minVal = Infinity;
-    let bestPeriod = 0;
-    
-    // We only compare up to the length allowed by the max period shift
-    const len = buffer.length - maxPeriod;
-    
-    for (let tau = minPeriod; tau <= maxPeriod; tau++) {
-        let currentSum = 0;
-        
-        // Optimization: Check every 2nd sample for performance without losing much accuracy
-        for (let i = 0; i < len; i += 2) {
-            const delta = buffer[i] - buffer[i + tau];
-            currentSum += Math.abs(delta);
         }
-        
-        if (currentSum < minVal) {
-            minVal = currentSum;
-            bestPeriod = tau;
+    };
+
+    for (let i = 0; i < smoothedNotes.length; i++) {
+        const note = smoothedNotes[i];
+        if (note !== currentNote) {
+            if (currentNote > 0) addNote(currentNote, currentStartIndex, i);
+            currentNote = note;
+            currentStartIndex = i;
         }
     }
-
-    // Confidence Check:
-    // If the "difference" (minVal) is high relative to the signal amplitude, it's likely not periodic (noise).
-    // Normalize minVal by number of samples checked (~len/2)
-    const numSamples = len / 2;
-    const avgDiff = minVal / numSamples;
     
-    // If average difference is > 80% of RMS, confidence is low
-    if (avgDiff > rms * 0.8) return 0;
-
-    return sampleRate / bestPeriod;
+    if (currentNote > 0) addNote(currentNote, currentStartIndex, smoothedNotes.length);
+    return notes;
 }
 
-// Simple 1D Median Filter to smooth note trajectory
+function applyLowPassFilter(data: Float32Array, cutoff: number, sampleRate: number): Float32Array {
+    const rc = 1.0 / (cutoff * 2 * Math.PI);
+    const dt = 1.0 / sampleRate;
+    const alpha = dt / (rc + dt);
+    const output = new Float32Array(data.length);
+    let lastVal = 0;
+    for (let i = 0; i < data.length; i++) {
+        lastVal = lastVal + alpha * (data[i] - lastVal);
+        output[i] = lastVal;
+    }
+    return output;
+}
+
+function createOfflineContext(sampleRate: number, totalDuration: number): { offlineCtx: OfflineAudioContext, mainBus: GainNode } {
+    const safeDuration = Math.max(1, totalDuration + 2.0); 
+    const length = Math.ceil(safeDuration * sampleRate);
+    
+    const offlineCtx = new OfflineAudioContext(1, length, sampleRate);
+    
+    const limiter = offlineCtx.createDynamicsCompressor();
+    limiter.threshold.value = -6;
+    limiter.knee.value = 10;
+    limiter.ratio.value = 15;
+    limiter.attack.value = 0.005;
+    limiter.release.value = 0.1;
+    
+    limiter.connect(offlineCtx.destination);
+    
+    const mainBus = offlineCtx.createGain();
+    mainBus.gain.value = 0.9; // High gain input to limiter
+    mainBus.connect(limiter);
+    return { offlineCtx, mainBus };
+}
+
+// --- INSTRUMENT SYNTHESIS ---
+
+/**
+ * SAXOPHONE: FM-Assisted Subtractive
+ * Rich, breathy, and slightly "growling".
+ */
+export async function renderLocalSaxophoneSolo(notes: NoteEvent[], sampleRate: number, totalDuration: number): Promise<AudioBuffer> {
+    const { offlineCtx, mainBus } = createOfflineContext(sampleRate, totalDuration);
+    
+    // Room Reverb
+    const reverb = createSimpleReverb(offlineCtx, sampleRate, 1.2);
+    const reverbGain = offlineCtx.createGain();
+    reverbGain.gain.value = 0.15;
+    reverb.connect(reverbGain).connect(mainBus);
+
+    notes.forEach(note => {
+        const freq = 440 * Math.pow(2, (note.note - 69) / 12);
+        const t = note.start;
+        const d = note.duration;
+        const vel = note.velocity; 
+
+        // Main Tone: Square wave (Hollow sound)
+        const osc = offlineCtx.createOscillator();
+        osc.type = 'square';
+        osc.frequency.value = freq;
+
+        // Sub-Oscillator for body
+        const subOsc = offlineCtx.createOscillator();
+        subOsc.type = 'sawtooth';
+        subOsc.frequency.value = freq;
+        const subGain = offlineCtx.createGain();
+        subGain.gain.value = 0.4;
+
+        // Growl FM: Adds texture (simulates throat)
+        const growlOsc = offlineCtx.createOscillator();
+        growlOsc.frequency.value = freq * 0.5; // Subharmonic
+        const growlGain = offlineCtx.createGain();
+        growlGain.gain.value = 15; // Modulation depth
+        growlOsc.connect(growlGain).connect(osc.frequency);
+
+        // Filter Envelope (Wah-like for expression)
+        const filter = offlineCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.Q.value = 2;
+        
+        const startCutoff = 300;
+        const peakCutoff = 800 + (vel * 1200);
+        
+        filter.frequency.setValueAtTime(startCutoff, t);
+        filter.frequency.linearRampToValueAtTime(peakCutoff, t + 0.05); // Attack
+        filter.frequency.exponentialRampToValueAtTime(startCutoff + 200, t + d); // Sustain level
+
+        // Amplitude
+        const amp = offlineCtx.createGain();
+        amp.gain.setValueAtTime(0, t);
+        amp.gain.linearRampToValueAtTime(vel * 0.5, t + 0.05);
+        amp.gain.setValueAtTime(vel * 0.4, t + d - 0.05);
+        amp.gain.linearRampToValueAtTime(0, t + d + 0.1);
+
+        // Breath Noise
+        const noise = createNoiseBuffer(offlineCtx);
+        const noiseSrc = offlineCtx.createBufferSource();
+        noiseSrc.buffer = noise;
+        const noiseFilter = offlineCtx.createBiquadFilter();
+        noiseFilter.type = 'bandpass';
+        noiseFilter.frequency.value = 2000;
+        const noiseAmp = offlineCtx.createGain();
+        noiseAmp.gain.value = 0.03 * vel;
+        
+        noiseSrc.connect(noiseFilter).connect(noiseAmp).connect(amp);
+        
+        growlOsc.start(t); growlOsc.stop(t + d + 0.1);
+        osc.connect(filter);
+        subOsc.connect(subGain).connect(filter);
+        filter.connect(amp);
+        amp.connect(mainBus);
+        amp.connect(reverb);
+
+        osc.start(t); osc.stop(t + d + 0.1);
+        subOsc.start(t); subOsc.stop(t + d + 0.1);
+        noiseSrc.start(t); noiseSrc.stop(t + d + 0.1);
+    });
+
+    return offlineCtx.startRendering();
+}
+
+/**
+ * VIOLIN: "Ensemble" Synthesis
+ * Addresses the "8-bit" issue by using 3 detuned oscillators to create width.
+ * Includes "Bow Noise" for realism.
+ */
+export async function renderLocalViolinSolo(notes: NoteEvent[], sampleRate: number, totalDuration: number): Promise<AudioBuffer> {
+    const { offlineCtx, mainBus } = createOfflineContext(sampleRate, totalDuration);
+
+    // Larger Hall Reverb for Violin
+    const reverb = createSimpleReverb(offlineCtx, sampleRate, 2.0);
+    const reverbGain = offlineCtx.createGain();
+    reverbGain.gain.value = 0.3;
+    reverb.connect(reverbGain).connect(mainBus);
+
+    notes.forEach(note => {
+        const freq = 440 * Math.pow(2, (note.note - 69) / 12);
+        const t = note.start;
+        const d = note.duration;
+        const vel = note.velocity;
+
+        // Master Vibrato LFO
+        const vibOsc = offlineCtx.createOscillator();
+        vibOsc.frequency.value = 5.5; // Classical vibrato rate
+        const vibGain = offlineCtx.createGain();
+        vibGain.gain.value = freq * 0.02; // Depth
+        
+        // ENSEMBLE: 3 Oscillators to remove "buzzy/8-bit" sound
+        // 1. Center
+        const osc1 = offlineCtx.createOscillator();
+        osc1.type = 'sawtooth';
+        osc1.frequency.value = freq;
+        vibOsc.connect(vibGain).connect(osc1.frequency);
+
+        // 2. Left (Detuned Flat)
+        const osc2 = offlineCtx.createOscillator();
+        osc2.type = 'sawtooth';
+        osc2.frequency.value = freq * 0.998; 
+        vibOsc.connect(vibGain).connect(osc2.frequency);
+
+        // 3. Right (Detuned Sharp)
+        const osc3 = offlineCtx.createOscillator();
+        osc3.type = 'sawtooth';
+        osc3.frequency.value = freq * 1.002;
+        vibOsc.connect(vibGain).connect(osc3.frequency);
+
+        // Mix Oscillators
+        const mixGain = offlineCtx.createGain();
+        mixGain.gain.value = 0.2; // Lower individual gain to prevent clipping
+
+        // Formant Filters (The Body of the Violin)
+        // This cuts the high "buzz" and boosts "wooden" frequencies
+        const bodyFilter = offlineCtx.createBiquadFilter();
+        bodyFilter.type = 'lowpass';
+        bodyFilter.frequency.value = 2200; // Cut harsh highs
+        bodyFilter.Q.value = 0.7;
+
+        const woodResonance = offlineCtx.createBiquadFilter();
+        woodResonance.type = 'peaking';
+        woodResonance.frequency.value = 1000; // Wooden body resonance
+        woodResonance.Q.value = 2;
+        woodResonance.gain.value = 5;
+
+        // Bow Noise (The Scratch) - only on attack
+        const bowNoise = createNoiseBuffer(offlineCtx);
+        const bowSrc = offlineCtx.createBufferSource();
+        bowSrc.buffer = bowNoise;
+        const bowFilter = offlineCtx.createBiquadFilter();
+        bowFilter.type = 'highpass';
+        bowFilter.frequency.value = 1500;
+        const bowEnv = offlineCtx.createGain();
+        bowEnv.gain.setValueAtTime(0.1, t);
+        bowEnv.gain.exponentialRampToValueAtTime(0.001, t + 0.15); // Short scratch
+        bowSrc.connect(bowFilter).connect(bowEnv).connect(bodyFilter);
+        bowSrc.start(t);
+
+        // Volume Envelope (Swell)
+        const amp = offlineCtx.createGain();
+        amp.gain.setValueAtTime(0, t);
+        amp.gain.linearRampToValueAtTime(vel * 0.8, t + 0.15); // Slow attack (Bowing)
+        amp.gain.setValueAtTime(vel * 0.8, t + d);
+        amp.gain.linearRampToValueAtTime(0, t + d + 0.25); // Release
+
+        // Connect Graph
+        osc1.connect(mixGain);
+        osc2.connect(mixGain);
+        osc3.connect(mixGain);
+        
+        mixGain.connect(woodResonance).connect(bodyFilter).connect(amp);
+        amp.connect(mainBus);
+        amp.connect(reverb);
+
+        vibOsc.start(t); vibOsc.stop(t + d + 0.25);
+        osc1.start(t); osc1.stop(t + d + 0.25);
+        osc2.start(t); osc2.stop(t + d + 0.25);
+        osc3.start(t); osc3.stop(t + d + 0.25);
+    });
+
+    return offlineCtx.startRendering();
+}
+
+/**
+ * PIANO: FM Synthesis (Rhodes Style)
+ * Much louder and cleaner than acoustic approximations.
+ * Uses Frequency Modulation to create bell-like tones.
+ */
+export async function renderLocalPianoSolo(notes: NoteEvent[], sampleRate: number, totalDuration: number): Promise<AudioBuffer> {
+    const { offlineCtx, mainBus } = createOfflineContext(sampleRate, totalDuration);
+
+    // Clean Plate Reverb
+    const reverb = createSimpleReverb(offlineCtx, sampleRate, 1.5);
+    const reverbGain = offlineCtx.createGain();
+    reverbGain.gain.value = 0.15;
+    reverb.connect(reverbGain).connect(mainBus);
+
+    notes.forEach(note => {
+        const freq = 440 * Math.pow(2, (note.note - 69) / 12);
+        const t = note.start;
+        const d = note.duration;
+        const vel = Math.max(0.4, note.velocity); // Ensure minimum volume
+
+        // FM ALGORITHM: Modulator -> Carrier -> Output
+        
+        // 1. Carrier (The fundamental tone)
+        const carrier = offlineCtx.createOscillator();
+        carrier.type = 'sine'; // Pure tone
+        carrier.frequency.value = freq;
+
+        // 2. Modulator (Adds harmonics/brightness)
+        const modulator = offlineCtx.createOscillator();
+        modulator.type = 'sine';
+        // Ratio 2.0 = Octave up (clean), 14.0 = Bell. 
+        // We mix a bit of both for an electric piano sound.
+        modulator.frequency.value = freq * 2.0; 
+
+        // Modulation Depth (Index) - Controlled by Envelope
+        const modGain = offlineCtx.createGain();
+        // Louder notes = Brighter sound (more modulation)
+        const modulationIndex = 500 * vel; 
+        
+        modGain.gain.setValueAtTime(modulationIndex, t);
+        modGain.gain.exponentialRampToValueAtTime(1, t + 0.4); // Brightness decays fast
+
+        modulator.connect(modGain);
+        modGain.connect(carrier.frequency);
+
+        // Amplitude Envelope (Percussive)
+        const amp = offlineCtx.createGain();
+        amp.gain.setValueAtTime(0, t);
+        amp.gain.linearRampToValueAtTime(vel, t + 0.01); // Instant Attack
+        amp.gain.exponentialRampToValueAtTime(vel * 0.2, t + 1.0); // Decay
+        amp.gain.linearRampToValueAtTime(0, t + d + 0.2); // Release
+
+        carrier.connect(amp);
+        amp.connect(mainBus);
+        amp.connect(reverb);
+
+        carrier.start(t); carrier.stop(t + d + 1.5);
+        modulator.start(t); modulator.stop(t + d + 1.5);
+    });
+
+    return offlineCtx.startRendering();
+}
+
+// --- UTILS ---
+
+function createSimpleReverb(ctx: BaseAudioContext, sampleRate: number, seconds: number): ConvolverNode {
+    const length = sampleRate * seconds;
+    const impulse = ctx.createBuffer(2, length, sampleRate);
+    const left = impulse.getChannelData(0);
+    const right = impulse.getChannelData(1);
+    for(let i=0; i<length; i++) {
+        // Exponential decay is more natural than linear
+        const decay = Math.pow(0.01, i / length); 
+        left[i] = (Math.random() * 2 - 1) * decay;
+        right[i] = (Math.random() * 2 - 1) * decay;
+    }
+    const convolver = ctx.createConvolver();
+    convolver.buffer = impulse;
+    return convolver;
+}
+
+function createNoiseBuffer(ctx: BaseAudioContext): AudioBuffer {
+    const bufferSize = ctx.sampleRate * 2; 
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const output = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+        output[i] = (Math.random() * 2 - 1) * 0.5;
+    }
+    return buffer;
+}
+
 function medianFilter(data: number[], windowSize: number): number[] {
     const result = new Array(data.length).fill(0);
     const half = Math.floor(windowSize / 2);
-    
     for (let i = 0; i < data.length; i++) {
         const windowValues = [];
-        // Collect neighbors
         for (let j = -half; j <= half; j++) {
             const idx = i + j;
-            if (idx >= 0 && idx < data.length) {
-                windowValues.push(data[idx]);
-            }
+            if (idx >= 0 && idx < data.length) windowValues.push(data[idx]);
         }
-        // Sort and pick middle
         windowValues.sort((a, b) => a - b);
         result[i] = windowValues[Math.floor(windowValues.length / 2)];
     }
     return result;
 }
 
-// Internal: Create MIDI Blob (Format 0)
-function createMidiFile(notes: {note: number, start: number, duration: number}[]): Blob {
-    const timeBase = 480; // Ticks per quarter note
-    const tempo = 500000; // 120 BPM (microseconds per beat)
+function detectPitchAMDF(buffer: Float32Array, sampleRate: number): number {
+    let rms = 0;
+    for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i];
+    rms = Math.sqrt(rms / buffer.length);
+    if (rms < 0.01) return 0; 
 
-    // Convert time (seconds) to ticks
-    // ticks = seconds * (beats/sec) * (ticks/beat)
-    // beats/sec = 120/60 = 2
-    // ticks = seconds * 2 * 480 = seconds * 960
-    const ticksPerSecond = 960;
+    const minFreq = 75;   
+    const maxFreq = 1200; 
+    const minPeriod = Math.floor(sampleRate / maxFreq);
+    const maxPeriod = Math.floor(sampleRate / minFreq);
+
+    let minVal = Infinity;
+    let bestPeriod = 0;
+    const len = buffer.length;
+    
+    for (let tau = minPeriod; tau <= maxPeriod; tau++) {
+        let currentSum = 0;
+        for (let i = 0; i < len - tau; i += 2) {
+            currentSum += Math.abs(buffer[i] - buffer[i + tau]);
+            if (currentSum >= minVal) break; // Optimization: early exit
+        }
+        if (currentSum < minVal) {
+            minVal = currentSum;
+            bestPeriod = tau;
+        }
+    }
+    
+    if (bestPeriod === 0) return 0;
+    return sampleRate / bestPeriod;
+}
+
+// MIDI Generation
+export function createMidiBlobFromNotes(notes: NoteEvent[], instrumentName: string = "Virtuoso Instrument"): Blob | null {
+    if (notes.length === 0) return null;
+    
+    const timeBase = 480; 
+    const tempo = 500000; 
+    const ticksPerSecond = 960; 
 
     const events: number[] = [];
 
-    // Variable Length Quantity Writer
     const writeVLQ = (value: number) => {
         const buffer = [];
         let v = value;
@@ -321,57 +597,50 @@ function createMidiFile(notes: {note: number, start: number, duration: number}[]
 
     let lastTick = 0;
 
-    // Add Tempo Meta Event at start
-    events.push(0x00); // Delta time 0
-    events.push(0xFF, 0x51, 0x03);
+    events.push(0x00, 0xFF, 0x51, 0x03);
     events.push((tempo >> 16) & 0xFF, (tempo >> 8) & 0xFF, tempo & 0xFF);
     
-    // Track Name
-    const trackName = "Virtuoso Sax";
-    events.push(0x00, 0xFF, 0x03, trackName.length, ...trackName.split('').map(c => c.charCodeAt(0)));
+    events.push(0x00, 0xFF, 0x03, instrumentName.length, ...instrumentName.split('').map(c => c.charCodeAt(0)));
 
-    // Flatten events
-    type MidiEvent = { tick: number, type: 'on'|'off', note: number };
+    type MidiEvent = { tick: number, type: 'on'|'off', note: number, velocity: number };
     const midiEvents: MidiEvent[] = [];
 
     notes.forEach(n => {
         const startTick = Math.round(n.start * ticksPerSecond);
         const endTick = Math.round((n.start + n.duration) * ticksPerSecond);
-        midiEvents.push({ tick: startTick, type: 'on', note: n.note });
-        midiEvents.push({ tick: endTick, type: 'off', note: n.note });
+        const midVel = Math.floor(Math.max(10, Math.min(127, n.velocity * 127)));
+        
+        midiEvents.push({ tick: startTick, type: 'on', note: n.note, velocity: midVel });
+        midiEvents.push({ tick: endTick, type: 'off', note: n.note, velocity: 0 });
     });
 
     midiEvents.sort((a, b) => a.tick - b.tick);
 
-    // Encode Events
     midiEvents.forEach(e => {
         const delta = Math.max(0, e.tick - lastTick);
         writeVLQ(delta);
         lastTick = e.tick;
 
         if (e.type === 'on') {
-            events.push(0x90, e.note, 90); // Note On, Vel 90
+            events.push(0x90, e.note, e.velocity); 
         } else {
-            events.push(0x80, e.note, 0); // Note Off
+            events.push(0x80, e.note, 0); 
         }
     });
 
-    // End of Track
     events.push(0x00, 0xFF, 0x2F, 0x00);
 
-    // Header Chunk
     const header = [
-        0x4D, 0x54, 0x68, 0x64, // MThd
-        0, 0, 0, 6,             // Length
-        0, 0,                   // Format 0
-        0, 1,                   // Tracks 1
+        0x4D, 0x54, 0x68, 0x64, 
+        0, 0, 0, 6,             
+        0, 0,                   
+        0, 1,                   
         (timeBase >> 8) & 0xFF, timeBase & 0xFF
     ];
 
-    // Track Chunk
     const trackLen = events.length;
     const trackHeader = [
-        0x4D, 0x54, 0x72, 0x6B, // MTrk
+        0x4D, 0x54, 0x72, 0x6B, 
         (trackLen >> 24) & 0xFF,
         (trackLen >> 16) & 0xFF,
         (trackLen >> 8) & 0xFF,
